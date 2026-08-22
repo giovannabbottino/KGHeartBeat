@@ -1,0 +1,272 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazil]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\geometry{margin=2.5cm}
+\hypersetup{
+colorlinks=true, linkcolor=blue!50!black, urlcolor=blue!60!black, citecolor=blue!50!black, pdftitle={Avaliação de Qualidade de Grafos RDF/Turtle no KGHeartbeat}
+}
+\lstdefinestyle{codigo}{
+basicstyle=\ttfamily\small, frame=single, breaklines=true, showstringspaces=false, columns=fullflexible, backgroundcolor=\color{gray!5}
+}
+\newcommand{\metrica}[1]{\texttt{#1}}
+\newcommand{\card}[1]{\left\lvert #1\right\rvert}
+\title{Avaliação de Qualidade de Grafos RDF/Turtle no KGHeartbeat\\
+\large Descrição formal do endpoint \texttt{POST /knowledge\_graph/evaluate-turtle}}
+\author{Documentação técnica do projeto KGHeartbeat}
+\date{\today}
+\begin{document}
+\maketitle
+\begin{abstract}
+Este artigo descreve formalmente o processo de avaliação executado pelo endpoint \texttt{POST /knowledge\_graph/evaluate-turtle} do KGHeartbeat. O serviço recebe um documento RDF serializado em Turtle, realiza sua análise sintática, extrai estatísticas estruturais e calcula sete escores locais de qualidade: acurácia, consistência, concisão, compreensibilidade, interpretabilidade, interligação e licenciamento. São apresentadas as definições, fórmulas, interpretações e limitações de cada medida. A análise é deliberadamente autocontida: não consulta um endpoint SPARQL, banco de dados ou fontes externas. Consequentemente, seu resultado deve ser interpretado como uma avaliação heurística do documento recebido, e não como uma avaliação integral da qualidade do grafo de conhecimento.
+\end{abstract}
+\section{Introdução}
+O endpoint estudado oferece uma forma síncrona de inspecionar sinais de qualidade que podem ser obtidos diretamente de um documento Turtle. Diferentemente do fluxo completo do KGHeartbeat, a operação não depende de MongoDB, de um serviço SPARQL ativo ou de metadados coletados externamente. Essa decisão torna a avaliação adequada à validação imediata de pequenos e médios artefatos RDF, embora limite o conjunto de dimensões observáveis. O endpoint é implementado em duas camadas. A camada HTTP, escrita em Node.js com Express, valida a requisição e gerencia a execução. A camada analítica, escrita em Python, utiliza RDFLib para interpretar o Turtle e produzir um documento JSON com métricas, escores e dimensões não avaliadas.
+\section{Visão geral da avaliação}
+Para facilitar a leitura, é importante separar três conceitos. Uma \textbf{métrica bruta} é uma contagem ou estatística extraída do Turtle, como o número de triplas ou de recursos com labels. Um \textbf{escore de dimensão} combina uma ou mais métricas para representar um aspecto de qualidade em uma escala de zero a um. O \textbf{escore global} é a média dos sete escores dimensionais e é apresentado também na escala de zero a cem.
+\begin{table}[htbp]
+  \centering
+  \caption{Resumo do que é avaliado, por que é avaliado e como é medido.}
+  \small
+  \begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{2.7cm}X X}
+    \toprule
+    \textbf{Dimensão} & \textbf{O que e por que se avalia} & \textbf{Como é calculada} \\
+    \midrule
+    Acurácia & Problemas lexicais que dificultam o uso correto dos dados. & Subtrai da nota a proporção de anotações vazias, espaços indevidos e literais tipados malformados. \\
+    Consistência & Uso de classes e propriedades reconhecidas no documento. & Subtrai a proporção de classes e propriedades usadas, mas não declaradas localmente. \\
+    Concisão & Redundância causada por triplas idênticas. & Subtrai a proporção de triplas duplicadas; há uma limitação prática causada pela deduplicação do RDFLib. \\
+    Compreensibilidade & Presença de nomes, títulos ou descrições que ajudam pessoas a entender os recursos. & Divide o número de recursos anotados pelo total de recursos. \\
+    Interpretabilidade & Uso de identificadores globais em vez de recursos anônimos. & Subtrai a proporção de blank nodes entre os recursos. \\
+    Interligação & Ligações que podem conectar o grafo a outros recursos. & Divide a soma de links \texttt{owl:sameAs} e links classificados como externos pelo total de recursos. \\
+    Licenciamento & Existência de informação que indique licença ou direitos de uso. & Atribui um quando encontra \texttt{dcterms:license} ou \texttt{dc:rights}, e zero caso contrário. \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+Em termos operacionais, o processo segue esta ordem: o servidor recebe o Turtle; o RDFLib verifica se a sintaxe é válida; o avaliador identifica triplas, recursos, anotações, vocabulários e ligações; as métricas brutas são calculadas; as sete dimensões recebem notas entre zero e um; por fim, a média dessas notas gera o escore global. As seções seguintes detalham cada etapa.
+\section{Contrato e fluxo de processamento}
+\subsection{Requisição}
+O recurso é acessado por meio de:
+\begin{lstlisting}[style=codigo]
+POST /knowledge_graph/evaluate-turtle
+Content-Type: text/turtle
+\end{lstlisting}
+Também são aceitos os tipos \texttt{application/x-turtle} e \texttt{text/plain}. O corpo contém diretamente o texto Turtle, e não um objeto JSON ou formulário multipart. O tamanho máximo aceito é de 10 MiB. Uma chamada típica é:
+\begin{lstlisting}[style=codigo]
+curl -X POST http://localhost:5000/knowledge_graph/evaluate-turtle \
+  -H "Content-Type: text/turtle" \
+  --data-binary @graph.ttl
+\end{lstlisting}
+Um corpo ausente ou composto somente por espaços resulta em \texttt{400 Bad Request}. A rota é explicitamente dispensada dos middlewares de upload e conexão com MongoDB, pois a avaliação é autocontida.
+\subsection{Execução do avaliador}
+Após a validação, o servidor cria um processo Python e executa \texttt{src/evaluate\_turtle.py}. O comando padrão é \texttt{python}, podendo ser substituído pela variável de ambiente \texttt{PYTHON\_COMMAND}. O conteúdo Turtle é transmitido pela entrada padrão do processo; o resultado JSON é recebido pela saída padrão. O tempo máximo de execução é 30 segundos. Os principais resultados HTTP são:
+\begin{table}[htbp]
+  \centering
+  \caption{Resultados possíveis do processamento HTTP.}
+  \begin{tabular}{>{\ttfamily}p{2.2cm}p{10.5cm}}
+    \toprule
+    \normalfont Código & Significado \\
+    \midrule
+    200 & Turtle válido e avaliação concluída. \\
+    400 & Corpo vazio ou não reconhecido como texto. \\
+    413 & Corpo superior ao limite configurado pelo Express. \\
+    422 & Turtle inválido ou erro analítico reportado pelo processo Python. \\
+    500 & Falha ao iniciar o avaliador ou resposta interna que não é JSON válido. \\
+    504 & Avaliação superior ao limite de 30 segundos. \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+\subsection{Construção do grafo RDF}
+Seja o grafo RDF interpretado representado por \( G \subseteq (U \cup B) \times U \times (U \cup B \cup L), \) em que \(U\) é o conjunto de URIs, \(B\) o conjunto de nós anônimos e \(L\) o conjunto de literais. Cada elemento de \(G\) é uma tripla \((s,p,o)\), formada por sujeito, predicado e objeto. O RDFLib realiza o parsing com o formato explicitamente definido como Turtle. Após essa etapa, são derivados os conjuntos:
+\begin{align*}
+S &= \{s \mid (s,p,o) \in G\},\\
+P &= \{p \mid (s,p,o) \in G\},\\
+O &= \{o \mid (s,p,o) \in G\},\\
+R &= \{x \in S \cup O \mid x \in U \cup B\}.
+\end{align*}
+O conjunto \(R\), denominado conjunto de recursos pela implementação, não inclui literais nem URIs que ocorram exclusivamente como predicado.
+\section{Métricas descritivas}
+As métricas desta seção apresentam as evidências diretamente extraídas do Turtle. Elas permitem verificar de onde vieram os escores e ajudam a diagnosticar problemas específicos. Cada grupo é introduzido por sua finalidade; em seguida, cada campo da resposta é definido juntamente com sua regra de cálculo.
+\subsection{Tamanho e composição}
+Este grupo avalia o tamanho e os tipos básicos de elementos presentes no grafo. Essas contagens são necessárias para descrever o payload e também servem como denominadores das dimensões de qualidade.
+\begin{description}[style=nextline]
+  \item[\metrica{number\_of\_triples}]
+Número de triplas distintas do grafo, isto é, \(\card{G}\).
+  \item[\metrica{number\_of\_entities}]
+Número de recursos distintos presentes como sujeito ou objeto: \(\card{R}\). O nome ``entidades'' deve ser entendido no sentido operacional da implementação, pois a contagem inclui nós anônimos e não exige uma declaração de tipo.
+  \item[\metrica{number\_of\_properties}]
+Número de predicados distintos utilizados: \(\card{P}\). Não é necessário que a propriedade esteja formalmente declarada.
+  \item[\metrica{number\_of\_blank\_nodes}]
+Cardinalidade de \(B \cap (S \cup O)\), considerando nós anônimos distintos.
+\end{description}
+\subsection{Anotações e idiomas}
+Este grupo avalia se os recursos possuem informação textual para identificação e descrição. Isso é relevante porque labels, títulos, comentários e idiomas tornam os dados mais compreensíveis e utilizáveis por pessoas e interfaces multilíngues.
+Seja \(A\) o conjunto de predicados de anotação reconhecidos:
+\begin{align*}
+A = \{&\texttt{rdfs:label},\texttt{rdfs:comment},
+\texttt{skos:prefLabel},\texttt{skos:altLabel},\\
+&\texttt{dc:title},\texttt{dcterms:title}\}.
+\end{align*}
+Define-se o conjunto de recursos anotados como
+\[
+R_A = \{s \mid (s,p,o) \in G \land p \in A\}.
+\]
+As métricas correspondentes são:
+\begin{description}[style=nextline]
+  \item[\metrica{number\_of\_labels\_or\_comments}]
+\(\card{R_A}\). A medida conta recursos distintos, não o número total de anotações. Também não exige que o objeto seja literal.
+  \item[\metrica{percentage\_of\_resources\_with\_labels}]
+Percentual de recursos anotados:
+  \[
+100 \times \frac{\card{R_A}}{\card{R}}.
+  \]
+Por convenção da implementação, divisões por zero produzem o valor zero.
+  \item[\metrica{languages}]
+Conjunto ordenado das tags de idioma presentes em quaisquer literais do grafo. A medida não fornece frequências e não valida semanticamente as tags.
+  \item[\metrica{empty\_annotations}]
+Número de triplas de anotação cujo objeto literal se torna vazio após a remoção de espaços nas extremidades.
+  \item[\metrica{annotations\_with\_surrounding\_whitespace}]
+Número de anotações literais não vazias em sua representação original cujo valor é alterado pela remoção de espaços nas extremidades. Um valor formado somente por espaços satisfaz tanto esta condição quanto a condição de anotação vazia, podendo receber duas penalizações posteriores.
+\end{description}
+\subsection{Estruturas, ligações e licença}
+Este grupo identifica construções estruturais, ligações semânticas e declarações de direitos. Essas informações ajudam a entender a organização interna do RDF, seu potencial de conexão com outros recursos e as condições declaradas de reutilização.
+\begin{description}[style=nextline]
+  \item[\metrica{rdf\_structures}]
+Número de triplas \((s,\texttt{rdf:type},o)\) nas quais \(o\) pertence ao conjunto \{\texttt{rdf:List}, \texttt{rdf:Seq}, \texttt{rdf:Bag}, \texttt{rdf:Alt}, \texttt{rdf:Statement}\}. A medida conta declarações de tipo, não verifica a formação completa da estrutura RDF.
+  \item[\metrica{same\_as\_links}]
+Número de triplas cujo predicado é \texttt{owl:sameAs}. Nesta contagem não há restrição sobre o tipo do objeto.
+  \item[\metrica{external\_links}]
+Número de triplas cujo predicado é \texttt{owl:sameAs} ou \texttt{rdfs:seeAlso} e cujo objeto é uma URI. O destino não é comparado com o namespace local; portanto, a denominação ``externo'' é heurística.
+  \item[\metrica{licenses}]
+Lista ordenada e sem repetição dos objetos associados a \texttt{dcterms:license} ou \texttt{dc:rights}. A existência, validade e permissividade da licença não são verificadas.
+\end{description}
+\subsection{Tipos e termos do vocabulário}
+Este grupo verifica se classes e propriedades usadas são reconhecidas no próprio documento, se existem termos explicitamente depreciados e se literais tipados podem ser convertidos. A finalidade é revelar dependências não declaradas, vocabulário obsoleto e erros lexicais de datatype.
+Um recurso é considerado declarado quando participa de uma tripla \((s,\texttt{rdf:type},o)\) cujo objeto é um dos tipos: \texttt{rdfs:Class}, \texttt{owl:Class}, \texttt{rdf:Property}, \texttt{owl:ObjectProperty}, \texttt{owl:DatatypeProperty} ou \texttt{owl:AnnotationProperty}.
+\begin{description}[style=nextline]
+  \item[\metrica{undefined\_classes}]
+Número de URIs utilizadas como objeto de \texttt{rdf:type} que não foram declaradas no próprio documento. URIs dos namespaces RDF, RDFS e OWL são excluídas. Classes definidas apenas em uma ontologia externa ainda são tratadas como indefinidas nesta análise local.
+  \item[\metrica{undefined\_properties}]
+Número de predicados utilizados, mas não declarados no documento. Predicados pertencentes aos namespaces RDF, RDFS e OWL são excluídos. Vocabulários como Dublin Core e SKOS podem, portanto, ser marcados como indefinidos quando suas declarações não acompanham o payload.
+  \item[\metrica{deprecated\_terms}]
+Número de recursos distintos tipados como \texttt{owl:DeprecatedClass} ou \texttt{owl:DeprecatedProperty}. O padrão alternativo \texttt{owl:deprecated true} não é detectado.
+  \item[\metrica{malformed\_datatype\_literals}]
+Número de literais tipados para os quais a conversão de RDFLib para um valor Python lança \texttt{ValueError}, \texttt{TypeError} ou \texttt{OverflowError}. O resultado depende do comportamento da versão do RDFLib, que pode apenas emitir um aviso para certas formas lexicais inválidas.
+\end{description}
+\subsection{Duplicidade}
+Esta métrica procura redundância exata no conteúdo, pois repetir a mesma tripla aumenta o documento sem acrescentar informação.
+A métrica \metrica{duplicate\_triples} pretende calcular
+\[
+D = \sum_{t} \max(f(t)-1,0),
+\]
+onde \(f(t)\) seria a frequência textual da tripla \(t\). Entretanto, um \texttt{Graph} do RDFLib possui semântica de conjunto e elimina repetições durante o parsing. A contagem ocorre somente depois dessa eliminação. Assim, no fluxo atual, \(D\) tende a ser sempre zero, mesmo que o documento de entrada repita uma tripla textualmente.
+\subsection{Comprimento das URIs}
+Estas estatísticas avaliam o tamanho dos identificadores usados em cada posição das triplas. Elas são fornecidas para caracterização e diagnóstico de padrões de URI, mas não alteram qualquer escore de qualidade.
+Para as URIs distintas encontradas em sujeitos, predicados e objetos, são produzidos, respectivamente, os objetos \metrica{subject\_uri\_length}, \metrica{predicate\_uri\_length} e \metrica{object\_uri\_length}. Cada objeto contém: quantidade, média, desvio-padrão populacional, mínimo e máximo. Se os comprimentos forem \(x_1,\ldots,x_n\), então
+\[
+\mu=\frac{1}{n}\sum_{i=1}^{n}x_i, \qquad \sigma=\sqrt{\frac{1}{n}\sum_{i=1}^{n}(x_i-\mu)^2}.
+\]
+Somente URIs são consideradas; literais e nós anônimos são excluídos. Como os termos são deduplicados antes do cálculo, a frequência de uso de uma URI não altera as estatísticas. Na ausência de URIs, todos os campos recebem zero. Essas medidas são descritivas e não participam do escore global.
+\section{Escores das dimensões}
+Considere a função de razão segura
+\[
+\rho(a,b)= \begin{cases} a/b, & b\neq 0,\\ 0,   & b=0. \end{cases}
+\]
+Cada escore é posteriormente limitado ao intervalo \([0,1]\). Denotem-se por \(T=\card{G}\), \(E\) as anotações vazias, \(W\) as anotações com espaços nas extremidades, \(M\) os literais tipados malformados, \(C_u\) as classes indefinidas, \(P_u\) as propriedades indefinidas, \(C_t\) as classes usadas, \(D\) as duplicatas, \(B_n\) os nós anônimos, \(S_a\) os links \texttt{owl:sameAs} e \(L_e\) os links classificados como externos.
+\subsection{Acurácia}
+\noindent\textbf{O que é avaliado?} A presença de anotações vazias, espaços indevidos nas extremidades de anotações e literais incompatíveis com seus datatypes. \textbf{Por que é avaliado?} Esses problemas indicam falhas lexicais que podem prejudicar apresentação, busca, conversão de tipos e processamento automático. \textbf{Como é calculado?} Somam-se os três tipos de problema, divide-se o resultado pelo número de triplas e subtrai-se essa proporção de um.
+\[
+Q_{acc}=1-\rho(E+W+M,\max(T,1)).
+\]
+\noindent\textbf{Como interpretar?} Um valor próximo de um indica poucos problemas lexicais em relação ao tamanho do grafo. O escore não mede a veracidade dos fatos RDF. Como o denominador é o número total de triplas, o mesmo número de problemas tem impacto menor em grafos maiores. Anotações formadas somente por espaços podem contribuir simultaneamente para \(E\) e \(W\).
+\subsection{Consistência}
+\noindent\textbf{O que é avaliado?} Se classes e propriedades utilizadas também estão declaradas ou pertencem aos namespaces básicos RDF, RDFS e OWL. \textbf{Por que é avaliado?} Termos sem definição local dificultam a interpretação do modelo e podem indicar erros de vocabulário. \textbf{Como é calculado?} Somam-se classes e propriedades indefinidas, divide-se pelo total de classes usadas e predicados distintos e subtrai-se a proporção de um.
+\[
+Q_{con}=1-\rho(C_u+P_u,\max(\card{C_t}+\card{P},1)).
+\]
+\noindent\textbf{Como interpretar?} Um valor alto indica que a maior parte dos termos usados é reconhecida localmente. Não é realizada inferência OWL nem verificação de disjunção, domínio, imagem, cardinalidade ou satisfatibilidade. Por isso, trata-se de consistência declarativa local, e não de consistência lógica completa.
+\subsection{Concisão}
+\noindent\textbf{O que é avaliado?} A repetição exata de triplas. \textbf{Por que é avaliado?} Redundância aumenta o volume do documento sem acrescentar informação. \textbf{Como é calculado?} Divide-se o número de repetições pelo número de triplas e subtrai-se a proporção de um.
+\[
+Q_{conc}=1-\rho(D,\max(T,1)).
+\]
+\noindent\textbf{Como interpretar?} Em princípio, um valor próximo de um indicaria pouca redundância. Na implementação atual, a deduplicação prévia do RDFLib faz com que \(D\) seja normalmente zero e \(Q_{conc}\) seja normalmente igual a um.
+\subsection{Compreensibilidade}
+\noindent\textbf{O que é avaliado?} A cobertura dos recursos por labels, comentários ou títulos reconhecidos. \textbf{Por que é avaliado?} Recursos documentados são mais fáceis de identificar e compreender por usuários e aplicações. \textbf{Como é calculado?} Divide-se o número de recursos com pelo menos uma anotação reconhecida pelo total de recursos.
+\[
+Q_{und}=\rho(\card{R_A},\card{R}).
+\]
+\noindent\textbf{Como interpretar?} Um valor de um significa que todos os recursos contabilizados possuem ao menos uma anotação reconhecida. A presença é avaliada, mas não a correção, clareza, unicidade ou cobertura por idioma das anotações.
+\subsection{Interpretabilidade}
+\noindent\textbf{O que é avaliado?} A proporção de recursos representados por blank nodes. \textbf{Por que é avaliado?} Recursos com URI são globalmente identificáveis e, em geral, mais fáceis de referenciar e reutilizar fora do documento. \textbf{Como é calculado?} Divide-se o número de blank nodes pelo total de recursos e subtrai-se a proporção de um.
+\[
+Q_{int}=1-\rho(B_n,\max(\card{R},1)).
+\]
+\noindent\textbf{Como interpretar?} Um valor alto indica predominância de recursos identificados por URI. Trata-se de uma escolha heurística: blank nodes são elementos válidos do modelo RDF e não implicam, isoladamente, baixa qualidade.
+\subsection{Interligação}
+\noindent\textbf{O que é avaliado?} A presença de triplas \texttt{owl:sameAs} e \texttt{rdfs:seeAlso} com destinos identificados por URI. \textbf{Por que é avaliado?} Ligações favorecem navegação, integração e descoberta de informação relacionada. \textbf{Como é calculado?} Somam-se os links \texttt{owl:sameAs} e os links classificados como externos, divide-se pelo total de recursos e limita-se o resultado ao máximo de um.
+\[
+Q_{link}=\min\left(1,\rho(S_a+L_e,\max(\card{R},1))\right).
+\]
+\noindent\textbf{Como interpretar?} Um valor alto representa maior quantidade de ligações em relação ao número de recursos. Há, contudo, sobreposição entre os contadores: um \texttt{owl:sameAs} cujo objeto é URI pertence tanto a \(S_a\) quanto a \(L_e\), sendo somado duas vezes. Além disso, não se comprova que o destino pertença a outro conjunto de dados.
+\subsection{Licenciamento}
+\noindent\textbf{O que é avaliado?} A existência de pelo menos uma declaração de licença ou direitos. \textbf{Por que é avaliado?} A informação de licenciamento ajuda usuários a determinar se e como os dados podem ser reutilizados. \textbf{Como é calculado?} A nota é binária: um quando existe ao menos um objeto associado a \texttt{dcterms:license} ou \texttt{dc:rights}, e zero quando não existe.
+\[
+Q_{lic}= \begin{cases} 1, & \text{se ao menos uma declaração de licença ou direitos for encontrada},\\ 0, & \text{caso contrário}. \end{cases}
+\]
+\noindent\textbf{Como interpretar?} O valor um confirma somente a presença de uma declaração; ele não confirma que a licença seja válida, conhecida, adequada ou juridicamente suficiente.
+\section{Escore global}
+O escore normalizado é a média aritmética não ponderada das sete dimensões:
+\[
+Q=\frac{Q_{acc}+Q_{con}+Q_{conc}+Q_{und}+Q_{int}+Q_{link}+Q_{lic}}{7}.
+\]
+O campo \metrica{normalized\_score} contém \(Q\), arredondado para seis casas decimais. O campo \metrica{score} utiliza a escala de 0 a 100:
+\[
+\operatorname{score}=100Q,
+\]
+arredondado para três casas decimais. Todas as dimensões recebem o mesmo peso. As dimensões que não podem ser observadas localmente são excluídas, e não recebem valor zero.
+\section{Dimensões não avaliadas}
+A resposta declara explicitamente como não avaliadas: disponibilidade, desempenho, segurança, reputação, atualidade, volatilidade, completude, credibilidade e verificabilidade. Em termos operacionais, essas dimensões exigem uma ou mais informações ausentes no payload isolado, tais como:
+\begin{itemize}
+  \item estado e tempo de resposta de um endpoint SPARQL;
+  \item comportamento do conjunto de dados ao longo do tempo;
+  \item universo de referência necessário para medir completude;
+  \item proveniência, reputação ou evidências mantidas externamente;
+  \item propriedades de segurança, autenticação e transporte do serviço.
+\end{itemize}
+\section{Estrutura da resposta}
+Uma resposta bem-sucedida possui a seguinte forma geral:
+\begin{lstlisting}[style=codigo]
+{
+  "score": 71.429,
+  "normalized_score": 0.714286,
+  "score_scale": "0-100",
+  "dimension_scores": {
+    "accuracy": 1.0,
+    "consistency": 0.5,
+    "conciseness": 1.0,
+    "understandability": 0.5,
+    "interpretability": 1.0,
+    "interlinking": 0.0,
+    "licensing": 1.0
+  },
+  "metrics": { "...": "..." },
+  "not_evaluated": ["availability", "performance", "..."]
+}
+\end{lstlisting}
+Os valores desse exemplo são meramente ilustrativos. O objeto \metrica{metrics} contém todas as contagens e estatísticas descritas neste artigo.
+\section{Limitações e interpretação dos resultados}
+O resultado não deve ser interpretado como prova de correção factual ou semântica do grafo. A avaliação observa o documento sob uma hipótese de mundo local: termos externos não importados podem parecer indefinidos, e a ausência de dados externos impede avaliar disponibilidade, completude e outras dimensões contextuais. Três limitações têm impacto direto nos escores. Primeiro, a deduplicação feita pelo RDFLib antes da contagem torna a métrica de duplicatas ineficaz. Segundo, \texttt{owl:sameAs} com objeto URI é contado em dois componentes da interligação. Terceiro, a consistência depende de declarações presentes no próprio payload, não da validade dos termos em seus vocabulários de origem. O escore global também agrega medidas heterogêneas por média simples. Uma licença presente tem o mesmo peso de toda a cobertura de anotações, e uma dimensão pode compensar numericamente outra. Para decisões críticas, recomenda-se analisar os escores dimensionais e as métricas brutas, em vez de utilizar apenas o valor global.
+\section{Conclusão}
+O endpoint fornece uma inspeção determinística, rápida e reproduzível de sinais estruturais presentes em um documento RDF/Turtle. Sua principal contribuição é reunir validação sintática, estatísticas descritivas e sete heurísticas de qualidade em uma única resposta JSON. O método é apropriado para triagem e diagnóstico inicial, desde que seus resultados sejam compreendidos dentro do escopo local da análise e das limitações formais apresentadas.
+\end{document}
